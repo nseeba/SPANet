@@ -1,0 +1,26 @@
+# HH-only ablation of the 5-feature VBF HH event definition.
+# The input representation is unchanged; only the training targets are reduced.
+
+INPUTS:
+  SEQUENTIAL:
+    Source:
+      mass: log_normalize
+      pt: log_normalize
+      eta: normalize
+      phi: normalize
+      btagDeepFlavB: none
+
+  GLOBAL:
+
+EVENT:
+  higgs_bb:
+    - b1: Source
+    - b2: Source
+
+PERMUTATIONS:
+  higgs_bb:
+    - [ b1, b2 ]
+
+REGRESSIONS:
+
+CLASSIFICATIONS:

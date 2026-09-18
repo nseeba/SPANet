@@ -31,13 +31,35 @@ class JetReconstructionTraining(JetReconstructionNetwork):
             for particle in self.event_particle_names
         }
 
-    def particle_symmetric_loss(self, assignment: Tensor, detection: Tensor, target: Tensor, mask: Tensor, weight: Tensor) -> Tensor:
+    def assignment_scale_for_branch(self, branch_name: str) -> float:
+        if branch_name == "higgs_bb":
+            return self.options.assignment_loss_scale * self.options.higgs_bb_assignment_loss_scale
+        if branch_name == "vbf":
+            return self.options.assignment_loss_scale * self.options.vbf_assignment_loss_scale
+        return self.options.assignment_loss_scale
+
+    def detection_scale_for_branch(self, branch_name: str) -> float:
+        if branch_name == "higgs_bb":
+            return self.options.detection_loss_scale * self.options.higgs_bb_detection_loss_scale
+        if branch_name == "vbf":
+            return self.options.detection_loss_scale * self.options.vbf_detection_loss_scale
+        return self.options.detection_loss_scale
+
+    def particle_symmetric_loss(
+        self,
+        branch_name: str,
+        assignment: Tensor,
+        detection: Tensor,
+        target: Tensor,
+        mask: Tensor,
+        weight: Tensor
+    ) -> Tensor:
         assignment_loss = assignment_cross_entropy_loss(assignment, target, mask, weight, self.options.focal_gamma)
         detection_loss = F.binary_cross_entropy_with_logits(detection, mask.float(), weight=weight, reduction='none')
 
         return torch.stack((
-            self.options.assignment_loss_scale * assignment_loss,
-            self.options.detection_loss_scale * detection_loss
+            self.assignment_scale_for_branch(branch_name) * assignment_loss,
+            self.detection_scale_for_branch(branch_name) * detection_loss
         ))
 
     def compute_symmetric_losses(self, assignments: List[Tensor], detections: List[Tensor], targets):
@@ -49,9 +71,9 @@ class JetReconstructionTraining(JetReconstructionNetwork):
 
             # Find the assignment loss for each particle in this permutation.
             current_permutation_loss = tuple(
-                self.particle_symmetric_loss(assignment, detection, target, mask, weight)
-                for assignment, detection, (target, mask, weight)
-                in zip(assignments, detections, targets[permutation])
+                self.particle_symmetric_loss(branch_name, assignment, detection, target, mask, weight)
+                for branch_name, assignment, detection, (target, mask, weight)
+                in zip(self.training_dataset.assignments, assignments, detections, targets[permutation])
             )
 
             # The loss for a single permutation is the sum of particle losses.
@@ -246,10 +268,10 @@ class JetReconstructionTraining(JetReconstructionNetwork):
         # ---------------------------------------------------------------------------------------------------
         with torch.no_grad():
             for name, l in zip(self.training_dataset.assignments, assignment_loss):
-                self.log(f"loss/{name}/assignment_loss", l, sync_dist=True)
+                self.log(f"loss/{name}/assignment_loss", l, sync_dist=True, on_step=True, on_epoch=True)
 
             for name, l in zip(self.training_dataset.assignments, detection_loss):
-                self.log(f"loss/{name}/detection_loss", l, sync_dist=True)
+                self.log(f"loss/{name}/detection_loss", l, sync_dist=True, on_step=True, on_epoch=True)
 
             if torch.isnan(assignment_loss).any():
                 raise ValueError("Assignment loss has diverged!")
@@ -285,6 +307,6 @@ class JetReconstructionTraining(JetReconstructionNetwork):
         # ---------------------------------------------------------------------------------------------------
         total_loss = torch.cat([loss.view(-1) for loss in total_loss])
 
-        self.log("loss/total_loss", total_loss.sum(), sync_dist=True)
+        self.log("loss/total_loss", total_loss.sum(), sync_dist=True, on_step=True, on_epoch=True)
 
         return total_loss.mean()

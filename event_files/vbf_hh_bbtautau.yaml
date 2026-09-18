@@ -1,0 +1,54 @@
+# ---------------------------------------------------
+# REQUIRED - INPUTS - List all inputs to SPANet here.
+# ---------------------------------------------------
+INPUTS:
+  # -----------------------------------------------------------------------------
+  # REQUIRED - SEQUENTIAL - inputs which can have an arbitrary number of vectors.
+  # -----------------------------------------------------------------------------
+  SEQUENTIAL:
+    Source:
+      mass: log_normalize
+      pt: log_normalize
+      eta: normalize
+      phi: normalize
+      btagDeepFlavB: none
+
+  # ---------------------------------------------------------------------
+  # REQUIRED - GLOBAL - inputs which will have a single vector per event.
+  # ---------------------------------------------------------------------
+  GLOBAL:
+
+
+# ----------------------------------------------------------------------
+# REQUIRED - EVENT - Complete list of resonance particles and daughters.
+# ----------------------------------------------------------------------
+EVENT:
+  higgs_bb:
+    - b1: Source
+    - b2: Source
+  vbf:
+    - q1: Source
+    - q2: Source
+
+# ---------------------------------------------------------
+# REQUIRED KEY - PERMUTATIONS - List of valid permutations.
+# ---------------------------------------------------------
+PERMUTATIONS:
+    higgs_bb:
+      - [ b1, b2 ]
+    vbf:
+      - [ q1, q2 ]
+
+
+# ------------------------------------------------------------------------------
+# REQUIRED - REGRESSIONS - List of desired features to regress from observables.
+# ------------------------------------------------------------------------------
+REGRESSIONS:
+
+
+# -----------------------------------------------------------------------------
+# REQUIRED - CLASSIFICATIONS - List of desired classes to predict from observables.
+# -----------------------------------------------------------------------------
+CLASSIFICATIONS:
+    EVENT:
+      - process_type  # 0 for ggF, 1 for VBF

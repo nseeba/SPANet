@@ -245,3 +245,13 @@ ipython_config.py
 *_logs/
 *_output/
 environment/
+
+# Local HEP datasets and generated model artifacts
+data/
+outputs/
+predictions/
+plots/
+slurm/
+*.h5
+*.parquet
+*.ckpt

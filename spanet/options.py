@@ -226,6 +226,16 @@ class Options(Namespace):
         # Scalar term for the direct classification loss of particles.
         self.detection_loss_scale: float = 0.0
 
+        # Optional per-branch overrides for the assignment loss.
+        # These fall back to the global assignment_loss_scale when left at 1.0.
+        self.higgs_bb_assignment_loss_scale: float = 1.0
+        self.vbf_assignment_loss_scale: float = 1.0
+
+        # Optional per-branch overrides for the detection loss.
+        # These fall back to the global detection_loss_scale when left at 1.0.
+        self.higgs_bb_detection_loss_scale: float = 1.0
+        self.vbf_detection_loss_scale: float = 1.0
+
         # Scalar term for the symmetric KL-divergence loss between distributions.
         self.kl_loss_scale: float = 0.0
 

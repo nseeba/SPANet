@@ -37,6 +37,13 @@ def mask_2(flat_data, size, index, value):
     data[:, index] = value
 
 
+@njit("void(float32[::1], int64, float32)")
+def mask_diagonal_2(flat_data, size, value):
+    data = flat_data.reshape((size, size))
+    for index in range(size):
+        data[index, index] = value
+
+
 @njit("void(float32[::1], int64, int64, float32)")
 def mask_3(flat_data, size, index, value):
     data = flat_data.reshape((size, size, size))
@@ -181,6 +188,13 @@ def extract_prediction(predictions, num_partons, max_jets):
     # -1 : Masked value
     # else : The actual index value
     results = np.zeros((num_targets, max_partons), np.int64) - 2
+
+    # A physical two-jet assignment must contain two distinct jets.  Mask
+    # diagonal entries before the first argmax; post-selection masking alone
+    # cannot prevent (j, j) from being selected as the first pair.
+    for i in range(num_targets):
+        if num_partons[i] == 2:
+            mask_diagonal_2(predictions[i], max_jets, float_negative_inf)
 
     for _ in range(num_targets):
         best_jet, best_prediction, best_value = maximal_prediction(predictions)

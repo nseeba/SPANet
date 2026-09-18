@@ -66,11 +66,18 @@ class JetReconstructionBase(pl.LightningModule):
 
     @property
     def dataloader_options(self):
-        return {
+        options = {
             "batch_size": self.options.batch_size,
             "pin_memory": self.options.num_gpu > 0,
             "num_workers": self.options.num_dataloader_workers,
         }
+        if self.options.num_dataloader_workers > 0:
+            options.update({
+                "persistent_workers": True,
+                "prefetch_factor": 4,
+            })
+
+        return options
 
     @property
     def event_info(self):

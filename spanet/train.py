@@ -4,6 +4,7 @@ from os import getcwd, makedirs, environ
 import shutil
 import json
 
+import numpy as np
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.profilers import PyTorchProfiler
@@ -22,6 +23,202 @@ from pytorch_lightning.callbacks import (
 )
 
 from spanet import JetReconstructionModel, Options
+
+
+class AssignmentDiagnosticsCallback(pl.Callback):
+    """
+    Log lightweight validation diagnostics to TensorBoard.
+
+    The callback intentionally evaluates only a configurable number of validation
+    batches so that it can run during normal training without dominating epoch
+    time on large samples.
+    """
+
+    def __init__(self, max_batches: int = 10):
+        super().__init__()
+        self.max_batches = max_batches
+
+    @staticmethod
+    def _has_tensorboard_experiment(logger) -> bool:
+        return (
+            logger is not None and
+            hasattr(logger, "experiment") and
+            hasattr(logger.experiment, "add_histogram")
+        )
+
+    @staticmethod
+    def _roc_figure(targets: np.ndarray, scores: np.ndarray, title: str):
+        try:
+            import matplotlib.pyplot as plt
+            from sklearn.metrics import auc, roc_curve
+        except Exception:
+            return None, None
+
+        if len(np.unique(targets)) < 2:
+            return None, None
+
+        fpr, tpr, _ = roc_curve(targets, scores)
+        roc_auc = auc(fpr, tpr)
+
+        fig, ax = plt.subplots(figsize=(5, 4))
+        ax.plot(fpr, tpr, label=f"AUC = {roc_auc:.3f}")
+        ax.plot([0, 1], [0, 1], linestyle="--", color="0.5", linewidth=1)
+        ax.set_xlabel("False positive rate")
+        ax.set_ylabel("True positive rate")
+        ax.set_title(title)
+        ax.legend(loc="lower right")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        return fig, roc_auc
+
+    @staticmethod
+    def _assignment_scores(outputs, jet_predictions, model) -> list[np.ndarray]:
+        scores = []
+        batch_indices = None
+
+        for assignment_logits, prediction, symmetries in zip(
+            outputs.assignments,
+            jet_predictions,
+            model.event_info.product_symbolic_groups.values(),
+        ):
+            prediction = torch.as_tensor(prediction, device=assignment_logits.device, dtype=torch.long)
+            if batch_indices is None:
+                batch_indices = torch.arange(prediction.shape[0], device=assignment_logits.device)
+
+            index = (batch_indices, *prediction.T)
+            probability = torch.exp(assignment_logits[index]) * symmetries.order()
+            scores.append(probability.detach().cpu().numpy())
+
+        return scores
+
+    @staticmethod
+    def _classification_confidences(classifications: dict[str, torch.Tensor]) -> dict[str, np.ndarray]:
+        output = {}
+        for name, logits in classifications.items():
+            probabilities = torch.softmax(logits, dim=1)
+            output[name] = probabilities.max(dim=1).values.detach().cpu().numpy()
+        return output
+
+    @staticmethod
+    def _pair_correct(prediction: np.ndarray, target: np.ndarray) -> np.ndarray:
+        return np.all(np.sort(prediction, axis=1) == np.sort(target, axis=1), axis=1)
+
+    def on_validation_epoch_end(self, trainer, pl_module) -> None:
+        if self.max_batches <= 0 or not self._has_tensorboard_experiment(trainer.logger):
+            return
+
+        val_loader = trainer.val_dataloaders
+        if isinstance(val_loader, (list, tuple)):
+            val_loader = val_loader[0]
+        if val_loader is None:
+            return
+
+        device = pl_module.device
+        product_names = list(pl_module.event_info.product_particles)
+        detection_scores = {name: [] for name in product_names}
+        detection_targets = {name: [] for name in product_names}
+        assignment_scores = {name: [] for name in product_names}
+        assignment_correct = {name: [] for name in product_names}
+        classification_confidences = {}
+
+        was_training = pl_module.training
+        pl_module.eval()
+
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(val_loader):
+                if batch_idx >= self.max_batches:
+                    break
+
+                batch = pl_module.transfer_batch_to_device(batch, device, 0)
+                sources, _, targets, _, _ = batch
+                outputs = pl_module.forward(sources)
+                jet_predictions, particle_scores, _, _ = pl_module.predict(sources)
+                prediction_scores = self._assignment_scores(outputs, jet_predictions, pl_module)
+
+                for i, name in enumerate(product_names):
+                    target, mask, _ = targets[i]
+                    target_np = target.detach().cpu().numpy()
+                    mask_np = mask.detach().cpu().numpy().astype(bool)
+                    prediction_np = jet_predictions[i]
+
+                    detection_scores[name].append(particle_scores[i])
+                    detection_targets[name].append(mask_np)
+
+                    assignment_scores[name].append(prediction_scores[i][mask_np])
+                    if mask_np.any():
+                        assignment_correct[name].append(
+                            self._pair_correct(prediction_np[mask_np], target_np[mask_np])
+                        )
+
+                for name, confidence in self._classification_confidences(outputs.classifications).items():
+                    classification_confidences.setdefault(name, []).append(confidence)
+
+        if was_training:
+            pl_module.train()
+
+        writer = trainer.logger.experiment
+        step = trainer.current_epoch + 1
+
+        for name in product_names:
+            det_score = np.concatenate(detection_scores[name]) if detection_scores[name] else np.array([])
+            det_target = np.concatenate(detection_targets[name]) if detection_targets[name] else np.array([])
+            if det_score.size:
+                writer.add_histogram(f"Diagnostics/{name}/detection_score", det_score, step)
+                figure, roc_auc = self._roc_figure(det_target.astype(int), det_score, f"{name} detection ROC")
+                if figure is not None:
+                    writer.add_figure(f"Diagnostics/{name}/detection_roc", figure, step, close=True)
+                    writer.add_scalar(f"Diagnostics/{name}/detection_auc", roc_auc, step)
+
+            assign_score = np.concatenate(assignment_scores[name]) if assignment_scores[name] else np.array([])
+            assign_correct = np.concatenate(assignment_correct[name]) if assignment_correct[name] else np.array([])
+            if assign_score.size:
+                writer.add_histogram(f"Diagnostics/{name}/assignment_score", assign_score, step)
+                if assign_correct.size:
+                    writer.add_histogram(
+                        f"Diagnostics/{name}/assignment_score_correct",
+                        assign_score[assign_correct],
+                        step,
+                    )
+                    writer.add_histogram(
+                        f"Diagnostics/{name}/assignment_score_wrong",
+                        assign_score[~assign_correct],
+                        step,
+                    )
+                    figure, roc_auc = self._roc_figure(
+                        assign_correct.astype(int),
+                        assign_score,
+                        f"{name} assignment-score ROC",
+                    )
+                    if figure is not None:
+                        writer.add_figure(f"Diagnostics/{name}/assignment_score_roc", figure, step, close=True)
+                        writer.add_scalar(f"Diagnostics/{name}/assignment_score_auc", roc_auc, step)
+
+        for name, confidences in classification_confidences.items():
+            confidence = np.concatenate(confidences)
+            writer.add_histogram(f"Diagnostics/classification/{name}_confidence", confidence, step)
+
+
+class EpochSummaryCallback(pl.Callback):
+    def on_validation_end(self, trainer, pl_module) -> None:
+        if trainer.sanity_checking or not trainer.is_global_zero:
+            return
+
+        metrics = trainer.callback_metrics
+        keys = (
+            "loss/total_loss_epoch",
+            "validation_average_jet_accuracy",
+            "validation_accuracy",
+        )
+        values = []
+        for key in keys:
+            if key in metrics:
+                value = metrics[key]
+                if hasattr(value, "detach"):
+                    value = value.detach().cpu().item()
+                values.append(f"{key}={value:.5g}")
+
+        if values:
+            print(f"Epoch {trainer.current_epoch + 1}: " + ", ".join(values), flush=True)
 
 
 def main(
@@ -47,6 +244,10 @@ def main(
         time_limit: Optional[str],
         batch_size: Optional[int],
         limit_dataset: Optional[float],
+        diagnostics_batches: int,
+        validate_every_n_epochs: int,
+        log_every_n_steps: int,
+        device_stats: bool,
         random_seed: int,
     ):
 
@@ -144,15 +345,19 @@ def main(
             verbose=options.verbose_output,
             filename='{epoch}-{step}-{validation_average_jet_accuracy:.3f}',
             monitor='validation_average_jet_accuracy',
-            save_top_k=3,
+            save_top_k=1,
             mode='max',
             save_last=True
         ),
         LearningRateMonitor(),
-        DeviceStatsMonitor(),
         RichProgressBar() if _RICH_AVAILABLE else TQDMProgressBar(),
-        RichModelSummary(max_depth=1) if _RICH_AVAILABLE else ModelSummary(max_depth=1)
+        RichModelSummary(max_depth=1) if _RICH_AVAILABLE else ModelSummary(max_depth=1),
+        EpochSummaryCallback(),
     ]
+    if device_stats:
+        callbacks.append(DeviceStatsMonitor())
+    if diagnostics_batches > 0:
+        callbacks.append(AssignmentDiagnosticsCallback(max_batches=diagnostics_batches))
 
     epochs = options.epochs
     profiler = None
@@ -170,6 +375,9 @@ def main(
         gradient_clip_val=options.gradient_clip if options.gradient_clip > 0 else None,
         max_epochs=epochs,
         max_time=time_limit,
+        check_val_every_n_epoch=validate_every_n_epochs,
+        log_every_n_steps=log_every_n_steps,
+        num_sanity_val_steps=0,
 
         logger=logger,
         profiler=profiler,
@@ -240,6 +448,19 @@ if __name__ == '__main__':
 
     parser.add_argument("-p", "--limit_dataset", type=float, default=None,
                         help="Limit dataset to only the first L percent of the data (0 - 100).")
+
+    parser.add_argument("--diagnostics-batches", type=int, default=0,
+                        help="Log TensorBoard score histograms and ROC figures from this many validation batches. "
+                             "Set to 0 to disable.")
+
+    parser.add_argument("--validate-every-n-epochs", type=int, default=1,
+                        help="Run validation every N training epochs.")
+
+    parser.add_argument("--log-every-n-steps", type=int, default=50,
+                        help="TensorBoard scalar logging interval in training steps.")
+
+    parser.add_argument("--device-stats", action="store_true",
+                        help="Enable Lightning DeviceStatsMonitor. Useful for debugging, but verbose and slower.")
 
     parser.add_argument("-fp16", "--fp16", action="store_true",
                         help="Use Torch AMP for training.")
