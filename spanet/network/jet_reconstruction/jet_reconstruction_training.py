@@ -31,6 +31,10 @@ class JetReconstructionTraining(JetReconstructionNetwork):
             for particle in self.event_particle_names
         }
 
+        # PCGrad uses Lightning manual optimization so each task can perform
+        # its own backward pass before the gradients are projected and merged.
+        self.automatic_optimization = not self.options.pcgrad
+
     def assignment_scale_for_branch(self, branch_name: str) -> float:
         if branch_name == "higgs_bb":
             return self.options.assignment_loss_scale * self.options.higgs_bb_assignment_loss_scale
@@ -301,6 +305,100 @@ class JetReconstructionTraining(JetReconstructionNetwork):
 
         if self.options.classification_loss_scale > 0:
             total_loss = self.add_classification_loss(total_loss, outputs.classifications, batch.classification_targets)
+
+        if self.options.pcgrad:
+            branches = list(self.training_dataset.assignments)
+            if branches != ["higgs_bb", "vbf"]:
+                raise ValueError("PCGrad currently requires higgs_bb and vbf branches in this order.")
+
+            # PCGrad currently operates on reconstruction losses only. Auxiliary
+            # objectives need an explicit task assignment before being enabled.
+            if any((self.options.kl_loss_scale > 0,
+                    self.options.regression_loss_scale > 0,
+                    self.options.classification_loss_scale > 0)):
+                raise ValueError("PCGrad currently supports assignment and detection losses only.")
+
+            task_losses = assignment_loss + detection_loss
+            task_weights = task_losses.new_tensor([
+                self.options.pcgrad_higgs_bb_weight,
+                self.options.pcgrad_vbf_weight,
+            ])
+            weighted_task_losses = task_losses * task_weights
+
+            optimizer = self.optimizers()
+            optimizer.zero_grad()
+            parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
+            task_gradients = []
+
+            for index, task_loss in enumerate(weighted_task_losses):
+                self.manual_backward(task_loss, retain_graph=index < len(weighted_task_losses) - 1)
+                task_gradients.append([
+                    parameter.grad.detach().float().clone()
+                    if parameter.grad is not None else torch.zeros_like(parameter, dtype=torch.float32)
+                    for parameter in parameters
+                ])
+                optimizer.zero_grad()
+
+            # Global protected PCGrad: HH is the protected task, so its full
+            # gradient is kept unchanged and only the globally conflicting
+            # component of the VBF gradient is removed. The projection is
+            # performed on the flattened gradient over all trainable
+            # parameters, rather than independently per parameter tensor.
+            projected_gradients = [list(gradients) for gradients in task_gradients]
+            hh_flat = torch.cat([gradient.reshape(-1) for gradient in task_gradients[0]])
+            vbf_flat = torch.cat([gradient.reshape(-1) for gradient in task_gradients[1]])
+            task_dot = torch.dot(vbf_flat, hh_flat)
+            hh_norm_squared = torch.dot(hh_flat, hh_flat)
+            projection_applied = task_dot < 0
+
+            if projection_applied:
+                projection_factor = task_dot / (hh_norm_squared + 1e-12)
+                projected_vbf_flat = vbf_flat - projection_factor * hh_flat
+                offset = 0
+                for parameter_index, gradient in enumerate(task_gradients[1]):
+                    size = gradient.numel()
+                    projected_gradients[1][parameter_index] = projected_vbf_flat[
+                        offset:offset + size
+                    ].view_as(gradient)
+                    offset += size
+
+            for parameter_index, parameter in enumerate(parameters):
+                # Match the automatic path's mean over its active branch/loss
+                # terms. Each task gradient contains one term per enabled
+                # loss type for that branch.
+                active_loss_types = int(self.options.assignment_loss_scale > 0) + \
+                    int(self.options.detection_loss_scale > 0)
+                merged = sum(projected[parameter_index] for projected in projected_gradients) / \
+                    (len(projected_gradients) * active_loss_types)
+                parameter.grad = merged.to(parameter.dtype)
+
+            if self.options.gradient_clip > 0:
+                torch.nn.utils.clip_grad_norm_(parameters, self.options.gradient_clip)
+            optimizer.step()
+            scheduler = self.lr_schedulers()
+            if scheduler is not None:
+                scheduler.step()
+
+            task_dot = torch.cat([gradient.reshape(-1) for gradient in task_gradients[0]])
+            vbf_dot = torch.cat([gradient.reshape(-1) for gradient in task_gradients[1]])
+            cosine = F.cosine_similarity(task_dot.unsqueeze(0), vbf_dot.unsqueeze(0)).squeeze(0)
+            conflict = (torch.dot(task_dot, vbf_dot) < 0).float()
+            self.log("pcgrad/task_cosine", cosine, on_step=True, on_epoch=True, sync_dist=True)
+            self.log("pcgrad/conflict", conflict, on_step=True, on_epoch=True, sync_dist=True)
+            self.log("pcgrad/projection_applied", projection_applied.float(),
+                     on_step=True, on_epoch=True, sync_dist=True)
+            self.log("pcgrad/hh_gradient_norm", hh_flat.norm(),
+                     on_step=True, on_epoch=True, sync_dist=True)
+            self.log("pcgrad/vbf_gradient_norm", vbf_flat.norm(),
+                     on_step=True, on_epoch=True, sync_dist=True)
+            self.log("pcgrad/weight_higgs_bb", task_weights[0], on_step=True, on_epoch=False)
+            self.log("pcgrad/weight_vbf", task_weights[1], on_step=True, on_epoch=False)
+            # Keep the reported loss on the same scale as the automatic path:
+            # it averages assignment and detection terms over both branches.
+            total_task_loss = task_losses.mean()
+            self.log("loss/total_loss", total_task_loss, sync_dist=True, on_step=True, on_epoch=True)
+
+            return {"loss": total_task_loss.detach()}
 
         # ===================================================================================================
         # Combine and return the loss

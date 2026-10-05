@@ -248,6 +248,13 @@ class Options(Namespace):
         # Automatically balance loss terms using Jacobians.
         self.balance_losses: bool = True
 
+        # Project conflicting gradients between the HH and VBF reconstruction tasks.
+        self.pcgrad: bool = False
+
+        # Optional task weights used by the PCGrad training path.
+        self.pcgrad_higgs_bb_weight: float = 1.0
+        self.pcgrad_vbf_weight: float = 1.0
+
         # Optimizer l2 penalty based on weight values.
         self.l2_penalty: float = 0.0
 

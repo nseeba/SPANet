@@ -372,7 +372,13 @@ def main(
         strategy="ddp" if options.num_gpu > 1 else "auto",
         precision="16-mixed" if fp16 else "32-true",
 
-        gradient_clip_val=options.gradient_clip if options.gradient_clip > 0 else None,
+        # Manual PCGrad performs clipping after the projected gradients are
+        # merged; Lightning's automatic clipping is incompatible with manual
+        # optimization.
+        gradient_clip_val=(
+            None if options.pcgrad
+            else options.gradient_clip if options.gradient_clip > 0 else None
+        ),
         max_epochs=epochs,
         max_time=time_limit,
         check_val_every_n_epoch=validate_every_n_epochs,
