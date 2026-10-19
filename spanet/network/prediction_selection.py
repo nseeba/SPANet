@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 import numpy as np
 
 import numba
@@ -154,26 +154,31 @@ def ravel_index(index, strides):
     return (index * strides).sum()
 
 
-@njit(numba.types.Tuple((TInt64, TInt64, TFloat32))(TPrediction))
-def maximal_prediction(predictions):
+@njit(numba.types.Tuple((TInt64, TInt64, TFloat32))(TPrediction, TFloat32[::1]))
+def maximal_prediction(predictions, offsets):
+    # The branch whose best assignment has the highest log-probability plus its offset wins.
+    # Returns the raw log-probability of the winning assignment.
     best_jet = -1
     best_prediction = -1
+    best_score = -np.float32(np.inf)
     best_value = -np.float32(np.inf)
 
     for i in range(len(predictions)):
         max_jet = np.argmax(predictions[i])
         max_value = predictions[i][max_jet]
+        max_score = max_value + offsets[i]
 
-        if max_value > best_value:
+        if np.isfinite(max_value) and max_score > best_score:
             best_prediction = i
+            best_score = max_score
             best_value = max_value
             best_jet = max_jet
 
     return best_jet, best_prediction, best_value
 
 
-@njit(TResult(TPrediction, TInt64[::1], TInt64))
-def extract_prediction(predictions, num_partons, max_jets):
+@njit(TResult(TPrediction, TInt64[::1], TInt64, TInt64[::1], TFloat32[::1]))
+def extract_prediction(predictions, num_partons, max_jets, decoding_order, offsets):
     float_negative_inf = -np.float32(np.inf)
     max_partons = num_partons.max()
     num_targets = len(predictions)
@@ -196,11 +201,25 @@ def extract_prediction(predictions, num_partons, max_jets):
         if num_partons[i] == 2:
             mask_diagonal_2(predictions[i], max_jets, float_negative_inf)
 
-    for _ in range(num_targets):
-        best_jet, best_prediction, best_value = maximal_prediction(predictions)
+    # decoding_order[0] < 0 : greedy, the remaining branch with the highest best-assignment
+    #                         log-probability plus offset chooses next.
+    # otherwise           : branches choose in the fixed order given by decoding_order.
+    ordered = decoding_order[0] >= 0
 
-        if not np.isfinite(best_value):
-            return results
+    for step in range(num_targets):
+        if ordered:
+            best_prediction = decoding_order[step]
+            best_jet = np.argmax(predictions[best_prediction])
+            best_value = predictions[best_prediction][best_jet]
+
+            # Not enough unused jets left for this branch, leave it unassigned (-2).
+            if not np.isfinite(best_value):
+                continue
+        else:
+            best_jet, best_prediction, best_value = maximal_prediction(predictions, offsets)
+
+            if not np.isfinite(best_value):
+                return results
 
         best_jets = unravel_index(best_jet, strides[best_prediction])
 
@@ -216,23 +235,55 @@ def extract_prediction(predictions, num_partons, max_jets):
     return results
 
 
-@njit(TResults(TPredictions, TInt64[::1], TInt64, TInt64), parallel=True)
-def _extract_predictions(predictions, num_partons, max_jets, batch_size):
+@njit(TResults(TPredictions, TInt64[::1], TInt64, TInt64, TInt64[::1], numba.types.float32[:, ::1]), parallel=True)
+def _extract_predictions(predictions, num_partons, max_jets, batch_size, decoding_order, offsets):
     output = np.zeros((batch_size, len(predictions), num_partons.max()), np.int64)
     predictions = [p.copy() for p in predictions]
 
     for batch in numba.prange(batch_size):
         current_prediction = numba.typed.List([prediction[batch] for prediction in predictions])
-        output[batch, :, :] = extract_prediction(current_prediction, num_partons, max_jets)
+        output[batch, :, :] = extract_prediction(
+            current_prediction, num_partons, max_jets, decoding_order, offsets[batch]
+        )
 
     return np.ascontiguousarray(output.transpose((1, 0, 2)))
 
 
-def extract_predictions(predictions: List[TArray]):
+def extract_predictions(
+    predictions: List[TArray],
+    decoding_order: Optional[List[int]] = None,
+    branch_offsets: Optional[TArray] = None,
+):
+    """ Choose non-overlapping jet assignments for every branch.
+
+    Parameters
+    ----------
+    predictions : list of [B, T, T, ...] log-probability arrays, one per branch.
+    decoding_order : optional list of branch indices. If given, every branch is listed exactly
+        once and the branches choose their jets in this order. If None, SPANet's greedy
+        decoding is used and the most confident remaining branch chooses next.
+    branch_offsets : optional [B, NUM_BRANCHES] array added to every branch's best
+        log-probability when greedy decoding compares branches, e.g. the log detection
+        probability plus a fixed per-branch bias. Ignored with a fixed decoding_order.
+    """
     flat_predictions = numba.typed.List([p.reshape((p.shape[0], -1)) for p in predictions])
     num_partons = np.array([len(p.shape) - 1 for p in predictions])
     max_jets = max(max(p.shape[1:]) for p in predictions)
     batch_size = max(p.shape[0] for p in predictions)
 
-    results = _extract_predictions(flat_predictions, num_partons, max_jets, batch_size)
+    if decoding_order is None or len(decoding_order) == 0:
+        order = np.full(len(predictions), -1, dtype=np.int64)
+    else:
+        order = np.asarray(decoding_order, dtype=np.int64)
+        if sorted(order.tolist()) != list(range(len(predictions))):
+            raise ValueError(f"decoding_order must list every branch index exactly once, got {decoding_order}")
+
+    if branch_offsets is None:
+        offsets = np.zeros((batch_size, len(predictions)), dtype=np.float32)
+    else:
+        offsets = np.ascontiguousarray(branch_offsets, dtype=np.float32)
+        if offsets.shape != (batch_size, len(predictions)):
+            raise ValueError(f"branch_offsets must have shape {(batch_size, len(predictions))}, got {offsets.shape}")
+
+    results = _extract_predictions(flat_predictions, num_partons, max_jets, batch_size, order, offsets)
     return [result[:, :partons] for result, partons in zip(results, num_partons)]

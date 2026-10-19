@@ -258,6 +258,12 @@ class JetReconstructionTraining(JetReconstructionNetwork):
             class_indices = (masks * self.particle_index_tensor.unsqueeze(1)).sum(0)
             weights *= self.particle_weights_tensor[class_indices]
 
+        # Balance every particle only by its own presence, independent of the other particles.
+        if self.balance_particles_per_branch:
+            particle_indices = torch.arange(masks.shape[0], device=masks.device).unsqueeze(1)
+            branch_weights = self.branch_particle_weights_tensor[particle_indices, masks.long()]
+            weights *= branch_weights.unsqueeze(1)
+
         # Balance based on the number of jets in this event
         if self.balance_jets:
             weights *= self.jet_weights_tensor[batch.num_vectors]

@@ -319,16 +319,43 @@ def main(
             print(f"Loading state dict from: {state_dict}")
 
         state_dict = torch.load(state_dict, map_location="cpu")["state_dict"]
+
+        # strict=False does not tolerate shape mismatches. A checkpoint with a different set of
+        # branches (e.g. an HH-only model) has differently shaped bookkeeping tensors such as the
+        # event permutation tensor, so skip those and keep the values computed for this model.
+        model_state = model.state_dict()
+        mismatched_keys = [
+            key for key, value in state_dict.items()
+            if key in model_state and model_state[key].shape != value.shape
+        ]
+        state_dict = {key: value for key, value in state_dict.items() if key not in mismatched_keys}
+
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
 
         if master:
             print(f"Missing Keys: {missing_keys}")
             print(f"Unexpected Keys: {unexpected_keys}")
+            print(f"Skipped Keys With Mismatched Shapes: {mismatched_keys}")
 
         if freeze_state_dict:
+            frozen_parameters = 0
             for pname, parameter in model.named_parameters():
-                if pname in state_dict:
+                if pname in state_dict and parameter.requires_grad:
                     parameter.requires_grad_(False)
+                    frozen_parameters += parameter.numel()
+
+            # Batch norm running statistics are buffers and keep updating in training mode even
+            # when the weights are frozen. A momentum of zero keeps the loaded statistics fixed.
+            for module in model.modules():
+                if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                    module_parameters = list(module.parameters(recurse=False))
+                    if module_parameters and not any(p.requires_grad for p in module_parameters):
+                        module.momentum = 0.0
+
+            if master:
+                trainable_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                print(f"Frozen Parameters: {frozen_parameters}")
+                print(f"Trainable Parameters: {trainable_parameters}")
 
     # Construct the logger for this training run. Logs will be saved in {logdir}/{name}/version_i
     log_dir = getcwd() if log_dir is None else log_dir
@@ -343,8 +370,8 @@ def main(
     callbacks = [
         ModelCheckpoint(
             verbose=options.verbose_output,
-            filename='{epoch}-{step}-{validation_average_jet_accuracy:.3f}',
-            monitor='validation_average_jet_accuracy',
+            filename='{epoch}-{step}-{' + options.checkpoint_monitor + ':.4f}',
+            monitor=options.checkpoint_monitor,
             save_top_k=1,
             mode='max',
             save_last=True

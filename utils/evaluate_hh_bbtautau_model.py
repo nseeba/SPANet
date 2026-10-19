@@ -30,11 +30,14 @@ SPANET_DIR = add_repo_to_path()
 
 from spanet import JetReconstructionModel, Options  # noqa: E402
 from spanet.dataset.types import Source  # noqa: E402
-from spanet.network.jet_reconstruction.jet_reconstruction_network import extract_predictions  # noqa: E402
+from spanet.network.jet_reconstruction.jet_reconstruction_network import (  # noqa: E402
+    detection_weighted_offsets,
+    extract_predictions,
+)
 
 
 def checkpoint_score(path: Path) -> float:
-    match = re.search(r"validation_average_jet_accuracy=([0-9]+(?:\\.[0-9]+)?)", path.name)
+    match = re.search(r"validation_average_jet_accuracy=([0-9]+(?:\.[0-9]+)?)", path.name)
     return float(match.group(1)) if match else -np.inf
 
 
@@ -128,7 +131,14 @@ def pair_correct(prediction: np.ndarray, target: np.ndarray) -> np.ndarray:
     return np.all(np.sort(prediction, axis=1) == np.sort(target, axis=1), axis=1)
 
 
-def evaluate(model: JetReconstructionModel, split: str, max_batches: int | None, fp16: bool):
+def evaluate(
+    model: JetReconstructionModel,
+    split: str,
+    max_batches: int | None,
+    fp16: bool,
+    decoding_order: list[int] | None,
+    branch_offsets: list[float] | None = None,
+):
     dataset = {
         "train": model.training_dataset,
         "validation": model.validation_dataset,
@@ -164,10 +174,13 @@ def evaluate(model: JetReconstructionModel, split: str, max_batches: int | None,
         with torch.no_grad(), torch.amp.autocast("cuda", enabled=fp16):
             network_outputs = model.forward(sources)
 
+        offsets = None
+        if branch_offsets is not None:
+            offsets = detection_weighted_offsets(network_outputs, branch_offsets)
         raw_predictions = extract_predictions([
-            np.nan_to_num(assignment.detach().cpu().numpy(), -np.inf)
+            np.nan_to_num(assignment.detach().cpu().numpy(), nan=-np.inf, neginf=-np.inf)
             for assignment in network_outputs.assignments
-        ])
+        ], decoding_order, offsets)
         detection_probabilities = np.stack([
             torch.sigmoid(detection).detach().cpu().numpy()
             for detection in network_outputs.detections
@@ -197,9 +210,11 @@ def evaluate(model: JetReconstructionModel, split: str, max_batches: int | None,
     return merged
 
 
-def write_output(output_file: Path, results: dict) -> None:
+def write_output(output_file: Path, results: dict, attributes: dict | None = None) -> None:
     output_file.parent.mkdir(parents=True, exist_ok=True)
     with h5py.File(output_file, "w") as f:
+        for key, value in (attributes or {}).items():
+            f.attrs[key] = value
         f.create_dataset("num_jets", data=results["num_jets"])
         for target, values in results.items():
             if target == "num_jets":
@@ -222,6 +237,16 @@ def parse_args():
     parser.add_argument("--max-batches", type=int)
     parser.add_argument("--gpu", action="store_true")
     parser.add_argument("--fp16", action="store_true")
+    parser.add_argument(
+        "--decoding-order",
+        help="Comma-separated branch order for decoding, e.g. 'higgs_bb,vbf', or 'greedy' for SPANet's "
+             "confidence-ordered decoding. Defaults to the decoding stored with the run.",
+    )
+    parser.add_argument(
+        "--detection-weighted-offsets",
+        help="Use detection-weighted greedy decoding with these per-branch offsets, e.g. 'higgs_bb=3.4'. "
+             "Branches that are not listed get 0. Cannot be combined with an explicit --decoding-order.",
+    )
     return parser.parse_args()
 
 
@@ -229,8 +254,52 @@ def main():
     args = parse_args()
     use_gpu = args.gpu and torch.cuda.is_available()
     model = load_model(args.run_dir, args.checkpoint, args.batch_size, use_gpu, args.test_file, args.event_file)
-    results = evaluate(model, split=args.split, max_batches=args.max_batches, fp16=args.fp16 and use_gpu)
-    write_output(args.output, results)
+    branch_names = list(model.event_info.product_particles)
+
+    # Decoding defaults to what is stored with the run; command line options override it.
+    decoding_order = model.decoding_order
+    branch_offsets = model.decoding_branch_offsets
+    if args.decoding_order is not None and args.detection_weighted_offsets is not None:
+        raise ValueError("--decoding-order and --detection-weighted-offsets cannot be combined.")
+    if args.decoding_order is not None:
+        branch_offsets = None
+        if args.decoding_order == "greedy":
+            decoding_order = None
+        else:
+            order_names = [name.strip() for name in args.decoding_order.split(",")]
+            if sorted(order_names) != sorted(branch_names):
+                raise ValueError(f"--decoding-order must list every branch once, branches are {branch_names}")
+            decoding_order = [branch_names.index(name) for name in order_names]
+    if args.detection_weighted_offsets is not None:
+        decoding_order = None
+        offsets = {}
+        for item in args.detection_weighted_offsets.split(","):
+            name, value = item.split("=")
+            if name.strip() not in branch_names:
+                raise ValueError(f"unknown branch '{name.strip()}' in --detection-weighted-offsets, "
+                                 f"branches are {branch_names}")
+            offsets[name.strip()] = float(value)
+        branch_offsets = [offsets.get(name, 0.0) for name in branch_names]
+
+    if decoding_order is not None:
+        decoding = "ordered:" + ",".join(branch_names[i] for i in decoding_order)
+    elif branch_offsets is not None:
+        decoding = "detection_weighted:" + ",".join(
+            f"{name}={offset:g}" for name, offset in zip(branch_names, branch_offsets)
+        )
+    else:
+        decoding = "greedy"
+    print("decoding:", decoding)
+
+    results = evaluate(
+        model,
+        split=args.split,
+        max_batches=args.max_batches,
+        fp16=args.fp16 and use_gpu,
+        decoding_order=decoding_order,
+        branch_offsets=branch_offsets,
+    )
+    write_output(args.output, results, {"decoding": decoding, "split": args.split})
 
 
 if __name__ == "__main__":

@@ -383,6 +383,33 @@ class JetReconstructionDataset(Dataset):
 
         return torch.from_numpy(index_tensor), target_weights_tensor
 
+    def compute_per_target_particle_balance(self):
+        """ Class weights for every target computed only from that target's own presence.
+
+        Returns a [NUM_TARGETS, 2] tensor where column 0 is the weight for events without the
+        target and column 1 the weight for events with the target. For a single target this
+        reproduces compute_particle_balance, so a multi-branch model weights each branch like
+        a model trained on that branch alone.
+        """
+        masks = torch.stack([target[1] for target in self.assignments.values()])
+        num_targets, num_events = masks.shape
+
+        beta = 1 - (10 ** -np.log10(num_events))
+        weights = torch.zeros(num_targets, 2)
+
+        for i in range(num_targets):
+            present_count = masks[i].sum().item() + 1
+            absent_count = (~masks[i]).sum().item() + 1
+
+            absent_weight = (1 - beta) / (1 - (beta ** absent_count))
+            present_weight = (1 - beta) / (1 - (beta ** present_count))
+            norm = absent_weight + present_weight
+
+            weights[i, 0] = 2 * absent_weight / norm
+            weights[i, 1] = 2 * present_weight / norm
+
+        return weights
+
     def compute_vector_balance(self):
         max_vectors = self.num_vectors.max()
         min_vectors = self.num_vectors.min()

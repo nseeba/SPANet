@@ -33,11 +33,14 @@ class BranchDecoder(nn.Module):
         self.softmax_output = softmax_output
         self.combinatorial_scale = options.combinatorial_scale
 
-        # Each branch has a personal encoder stack to extract particle-level data
+        # Each branch has a personal encoder stack to extract particle-level data.
+        # Branches can request extra transformer layers, e.g. to give a branch that is
+        # detached from the shared encoder more capacity of its own.
+        extra_encoder_layers = int(options.branch_extra_encoder_layers.get(particle_name, 0))
         self.encoder = StackedEncoder(
             options,
             options.num_branch_embedding_layers,
-            options.num_branch_encoder_layers
+            options.num_branch_encoder_layers + extra_encoder_layers
         )
 
         # Symmetric attention to create the output distribution

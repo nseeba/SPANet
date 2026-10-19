@@ -102,6 +102,14 @@ class JetReconstructionValidation(JetReconstructionNetwork):
         weighted_avg_jet_accuracy = weighted_jet_accuracies[has_targets] / tot_target_weights[has_targets]
         metrics["validation_average_jet_accuracy"] = np.mean(weighted_avg_jet_accuracy)
 
+        # Exact-pair accuracy of every branch on the events where that branch is present.
+        # Predictions and targets were already sorted within their symmetric groups.
+        for name, prediction, target, mask in zip(
+            self.training_dataset.assignments, jet_predictions, stacked_targets, stacked_masks
+        ):
+            correct = np.all(prediction == target, axis=1)
+            metrics[f"validation_{name}_accuracy"] = correct[mask].mean() if mask.any() else np.nan
+
         return metrics
 
     def validation_step(self, batch, batch_idx) -> Dict[str, np.float32]:

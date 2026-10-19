@@ -130,7 +130,7 @@ class SPANetInterface:
         self.network = self.network.to(device)
         return self
 
-    def __call__(self, features: Dict[str, Dict[str, ArrayLike]], assignment_fn=default_assignment_fn) -> Predictions:
+    def __call__(self, features: Dict[str, Dict[str, ArrayLike]], assignment_fn=None) -> Predictions:
         sources = self.sources_from_features(features)
         predictions = self.network.predict(sources, assignment_fn=assignment_fn)
         return self.add_names_to_predictions(predictions)

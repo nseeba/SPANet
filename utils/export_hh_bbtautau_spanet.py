@@ -205,6 +205,99 @@ class SPANetHHBBTauTauExport(nn.Module):
         return assignments, detections
 
 
+def best_pair(log_probabilities: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """ Best jet pair of a [B, J, J] log-probability table.
+
+    Returns the log-probability [B] and the pair [B, 2], sorted so that the lower jet index
+    comes first, like the SPANet decoder.
+    """
+    num_jets = log_probabilities.shape[-1]
+    value, flat_index = log_probabilities.flatten(1).max(dim=1)
+    first = torch.div(flat_index, num_jets, rounding_mode="floor")
+    second = flat_index - first * num_jets
+    pair = torch.stack((torch.minimum(first, second), torch.maximum(first, second)), dim=1)
+    return value, pair
+
+
+def without_jets(log_probabilities: torch.Tensor, pair: torch.Tensor) -> torch.Tensor:
+    """ Mask every entry of a [B, J, J] table that uses one of the jets in pair [B, 2]. """
+    num_jets = log_probabilities.shape[-1]
+    jets = torch.arange(num_jets, device=pair.device)
+    used = (jets[None, :] == pair[:, 0:1]) | (jets[None, :] == pair[:, 1:2])
+    return log_probabilities.masked_fill(used[:, :, None] | used[:, None, :], float("-inf"))
+
+
+class SPANetHHBBTauTauDecodedExport(nn.Module):
+    """
+    Inference wrapper that also performs the jet decoding, so ColumnFlow receives final pairs.
+
+    Decoding for the two branches (higgs_bb, vbf): each branch's score is the log-probability
+    of its best pair plus log(detection probability) plus a fixed branch offset. The branch with
+    the higher score chooses first (HH on ties), the other branch chooses from the remaining
+    jets. This reproduces spanet.network.prediction_selection with detection-weighted greedy
+    decoding. With use_detection=False and zero offsets it is plain SPANet greedy decoding.
+
+    Outputs (ColumnFlow 6-tuple contract):
+        hhb_indices [B, 2] int64, vbf_indices [B, 2] int64 (-1 if no pair could be chosen),
+        hhb_detection [B], vbf_detection [B], hhb_assignment [B], vbf_assignment [B].
+    """
+
+    def __init__(self, model: JetReconstructionModel, branch_offsets: tuple[float, float], use_detection: bool):
+        super().__init__()
+        self.network = SPANetHHBBTauTauExport(model)
+        self.branch_offsets = tuple(float(offset) for offset in branch_offsets)
+        self.use_detection = use_detection
+
+        # Both branches are symmetric jet pairs: probability of an unordered pair is 2 * exp(log p).
+        self.symmetry_order = 2.0
+
+    def forward(self, features: torch.Tensor, mask: torch.Tensor):
+        (hh_table, vbf_table), (hh_detection, vbf_detection) = self.network(features, mask)
+        # Events without any valid pair give NaN tables. Map NaN to -inf but keep the -inf of
+        # masked entries (torch.nan_to_num would also turn -inf into a finite number).
+        hh_table = torch.where(torch.isnan(hh_table), float("-inf"), hh_table.float())
+        vbf_table = torch.where(torch.isnan(vbf_table), float("-inf"), vbf_table.float())
+
+        hh_value, hh_pair = best_pair(hh_table)
+        vbf_value, vbf_pair = best_pair(vbf_table)
+
+        hh_score = hh_value + self.branch_offsets[0]
+        vbf_score = vbf_value + self.branch_offsets[1]
+        if self.use_detection:
+            hh_score = hh_score + torch.log(hh_detection.clamp_min(1e-30))
+            vbf_score = vbf_score + torch.log(vbf_detection.clamp_min(1e-30))
+
+        # A branch without any valid pair never chooses first.
+        hh_score = torch.where(torch.isfinite(hh_value), hh_score, torch.full_like(hh_score, float("-inf")))
+        vbf_score = torch.where(torch.isfinite(vbf_value), vbf_score, torch.full_like(vbf_score, float("-inf")))
+        hh_first = hh_score >= vbf_score
+
+        # Second choice for each branch, after the other branch took its jets.
+        vbf_after_hh_value, vbf_after_hh_pair = best_pair(without_jets(vbf_table, hh_pair))
+        hh_after_vbf_value, hh_after_vbf_pair = best_pair(without_jets(hh_table, vbf_pair))
+
+        hh_first_pair = hh_first[:, None]
+        hh_indices = torch.where(hh_first_pair, hh_pair, hh_after_vbf_pair)
+        vbf_indices = torch.where(hh_first_pair, vbf_after_hh_pair, vbf_pair)
+        hh_log_probability = torch.where(hh_first, hh_value, hh_after_vbf_value)
+        vbf_log_probability = torch.where(hh_first, vbf_after_hh_value, vbf_value)
+
+        # Mark branches that could not get a valid pair (too few jets).
+        hh_valid = torch.isfinite(hh_log_probability)
+        vbf_valid = torch.isfinite(vbf_log_probability)
+        hh_indices = torch.where(hh_valid[:, None], hh_indices, torch.full_like(hh_indices, -1))
+        vbf_indices = torch.where(vbf_valid[:, None], vbf_indices, torch.full_like(vbf_indices, -1))
+
+        hh_assignment = torch.where(
+            hh_valid, torch.exp(hh_log_probability) * self.symmetry_order, torch.zeros_like(hh_log_probability)
+        )
+        vbf_assignment = torch.where(
+            vbf_valid, torch.exp(vbf_log_probability) * self.symmetry_order, torch.zeros_like(vbf_log_probability)
+        )
+
+        return hh_indices, vbf_indices, hh_detection, vbf_detection, hh_assignment, vbf_assignment
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("run_dir", type=Path, help="SPANet training run directory containing options.json.")
@@ -213,6 +306,19 @@ def parse_args():
     parser.add_argument("--event-file", type=Path, help="Override event YAML. Useful when exporting older checkpoints.")
     parser.add_argument("--max-jets", type=int, default=16)
     parser.add_argument("--num-features", type=int, help="Number of input features. Defaults to the number implied by the event file.")
+    parser.add_argument(
+        "--decoding",
+        choices=("raw", "greedy", "detection_weighted"),
+        default="raw",
+        help="'raw' exports the assignment tables and detection probabilities, decoding is done in "
+             "ColumnFlow. 'greedy' and 'detection_weighted' decode inside the model and export the "
+             "6-tuple (hhb_indices, vbf_indices, hhb_detection, vbf_detection, hhb_assignment, vbf_assignment).",
+    )
+    parser.add_argument(
+        "--detection-weighted-offsets",
+        default="",
+        help="Per-branch offsets for --decoding detection_weighted, e.g. 'higgs_bb=3.4'. Unlisted branches get 0.",
+    )
     return parser.parse_args()
 
 
@@ -220,7 +326,28 @@ def main() -> None:
     args = parse_args()
     model = load_model(args.run_dir, args.checkpoint, args.event_file)
     make_model_exportable(model, args.max_jets)
-    wrapper = SPANetHHBBTauTauExport(model).eval()
+
+    branch_names = list(model.event_info.product_particles)
+    if args.decoding == "raw":
+        if args.detection_weighted_offsets:
+            raise ValueError("--detection-weighted-offsets requires --decoding detection_weighted.")
+        wrapper = SPANetHHBBTauTauExport(model).eval()
+    else:
+        if branch_names != ["higgs_bb", "vbf"]:
+            raise ValueError(f"decoded export expects branches ['higgs_bb', 'vbf'], got {branch_names}")
+        offsets = {}
+        for item in filter(None, args.detection_weighted_offsets.split(",")):
+            name, value = item.split("=")
+            if name.strip() not in branch_names:
+                raise ValueError(f"unknown branch '{name.strip()}', branches are {branch_names}")
+            offsets[name.strip()] = float(value)
+        if args.decoding == "greedy" and offsets:
+            raise ValueError("--detection-weighted-offsets requires --decoding detection_weighted.")
+        branch_offsets = tuple(offsets.get(name, 0.0) for name in branch_names)
+        wrapper = SPANetHHBBTauTauDecodedExport(
+            model, branch_offsets, use_detection=args.decoding == "detection_weighted"
+        ).eval()
+        print(f"decoding inside the model: {args.decoding}, branch offsets {dict(zip(branch_names, branch_offsets))}")
     num_features = model.event_info.num_features("Source")
     if args.num_features is not None and args.num_features != num_features:
         raise ValueError(

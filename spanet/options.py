@@ -255,6 +255,37 @@ class Options(Namespace):
         self.pcgrad_higgs_bb_weight: float = 1.0
         self.pcgrad_vbf_weight: float = 1.0
 
+        # Per-branch scale for the gradient flowing from a branch decoder back into the
+        # shared embedding and encoder, e.g. {"vbf": 0.0}. A scale of 0.0 detaches the
+        # branch completely, so only the remaining branches train the shared layers.
+        # Branches that are not listed use a scale of 1.0 (standard SPANet behaviour).
+        self.branch_shared_gradient_scale: dict = {}
+
+        # Per-branch number of additional transformer layers in the branch encoder,
+        # e.g. {"vbf": 2}. These are added on top of num_branch_encoder_layers.
+        self.branch_extra_encoder_layers: dict = {}
+
+        # Weight each branch's losses only by whether that branch is present, instead of
+        # by the joint presence pattern of all branches. Requires balance_particles.
+        self.balance_particles_per_branch: bool = False
+
+        # Fixed order in which branches choose their jets during decoding,
+        # e.g. ["higgs_bb", "vbf"]. An empty list keeps SPANet's greedy decoding, where
+        # the branch with the most confident assignment chooses first.
+        self.assignment_decoding_order: list = []
+
+        # Detection-weighted greedy decoding: branches are compared by the log-probability of
+        # their best assignment plus their log detection probability plus a per-branch offset,
+        # e.g. {"higgs_bb": 3.4}. A branch whose particle is probably absent then cannot take
+        # jets first just by being confidently wrong. Cannot be combined with
+        # assignment_decoding_order.
+        self.detection_weighted_decoding: bool = False
+        self.decoding_branch_offsets: dict = {}
+
+        # Validation metric used to select the best checkpoint. Per-branch metrics are
+        # logged as validation_<branch>_accuracy.
+        self.checkpoint_monitor: str = "validation_average_jet_accuracy"
+
         # Optimizer l2 penalty based on weight values.
         self.l2_penalty: float = 0.0
 
