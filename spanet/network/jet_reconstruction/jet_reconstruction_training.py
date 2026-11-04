@@ -226,15 +226,12 @@ class JetReconstructionTraining(JetReconstructionNetwork):
 
         return total_loss + classification_terms
 
-    def training_step(self, batch: Batch, batch_nb: int) -> Dict[str, Tensor]:
-        # ===================================================================================================
-        # Network Forward Pass
-        # ---------------------------------------------------------------------------------------------------
-        outputs = self.forward(batch.sources)
+    def reconstruction_losses(self, outputs, batch: Batch) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """ Weighted assignment and detection losses per particle, shared by training and validation.
 
-        # ===================================================================================================
-        # Initial log-likelihood loss for classification task
-        # ---------------------------------------------------------------------------------------------------
+        Returns (assignment_loss [NUM_PARTICLES], detection_loss [NUM_PARTICLES], masks [NUM_PARTICLES, 1, B],
+        weights [NUM_PARTICLES, 2, B]).
+        """
         symmetric_losses, best_indices = self.symmetric_losses(
             outputs.assignments,
             outputs.detections,
@@ -272,6 +269,18 @@ class JetReconstructionTraining(JetReconstructionNetwork):
         masks = masks.unsqueeze(1)
         symmetric_losses = (weights * symmetric_losses).sum(-1) / torch.clamp(masks.sum(-1), 1, None)
         assignment_loss, detection_loss = torch.unbind(symmetric_losses, 1)
+        return assignment_loss, detection_loss, masks, weights
+
+    def training_step(self, batch: Batch, batch_nb: int) -> Dict[str, Tensor]:
+        # ===================================================================================================
+        # Network Forward Pass
+        # ---------------------------------------------------------------------------------------------------
+        outputs = self.forward(batch.sources)
+
+        # ===================================================================================================
+        # Initial log-likelihood loss for classification task
+        # ---------------------------------------------------------------------------------------------------
+        assignment_loss, detection_loss, masks, weights = self.reconstruction_losses(outputs, batch)
 
         # ===================================================================================================
         # Some basic logging

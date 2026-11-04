@@ -14,7 +14,7 @@
 # TIME_LIMIT (DD:HH:MM:SS) stops training cleanly after that time, e.g. for learning-rate tests.
 #SBATCH -p gpu
 #SBATCH --gres gpu:l40:1
-#SBATCH --mem-per-gpu 64G
+#SBATCH --mem-per-gpu 32G
 #SBATCH --cpus-per-task 8
 #SBATCH --time 96:00:00
 #SBATCH -o /local/norman/UHHAnalysis/SPANet/slurm/slurm-%x-%j-%N.out

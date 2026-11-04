@@ -113,6 +113,21 @@ class JetReconstructionValidation(JetReconstructionNetwork):
         return metrics
 
     def validation_step(self, batch, batch_idx) -> Dict[str, np.float32]:
+        # Validation losses: the same weighted assignment and detection losses as in training, so the
+        # curves can be compared directly (training logs loss/..., validation logs validation_loss/...).
+        outputs = self.forward(batch.sources)
+        assignment_loss, detection_loss, _, _ = self.reconstruction_losses(outputs, batch)
+        total_terms = []
+        for name, a_loss, d_loss in zip(self.training_dataset.assignments, assignment_loss, detection_loss):
+            self.log(f"validation_loss/{name}/assignment_loss", a_loss, sync_dist=True, on_epoch=True)
+            self.log(f"validation_loss/{name}/detection_loss", d_loss, sync_dist=True, on_epoch=True)
+            if self.options.assignment_loss_scale > 0:
+                total_terms.append(a_loss)
+            if self.options.detection_loss_scale > 0:
+                total_terms.append(d_loss)
+        if total_terms:
+            self.log("validation_loss/total_loss", torch.stack(total_terms).sum(), sync_dist=True, on_epoch=True)
+
         # Run the base prediction step
         sources, num_jets, targets, regression_targets, classification_targets = batch
         jet_predictions, particle_scores, regressions, classifications = self.predict(sources)
