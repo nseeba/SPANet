@@ -5,10 +5,15 @@
 #   PARITY=even sbatch scripts/train_vbf_hh_bbtautau_v2_evenodd_gpu.sh
 #   PARITY=odd  sbatch scripts/train_vbf_hh_bbtautau_v2_evenodd_gpu.sh
 #
+# The default GPU is a full L40/L40S (never a MIG slice). To use an RTX 2070 SUPER instead (about 4x slower):
+#   PARITY=even sbatch --gres gpu:rtx:1 scripts/train_vbf_hh_bbtautau_v2_evenodd_gpu.sh
+# To resume an interrupted run, keep RUN_NAME and pass its last checkpoint:
+#   PARITY=even RUN_NAME=<name> CHECKPOINT=<run dir>/version_0/checkpoints/last.ckpt sbatch ...
+#
 # EPOCHS and LIMIT_DATASET can be overridden for a smoke test, SEED for repeated trainings,
 # TIME_LIMIT (DD:HH:MM:SS) stops training cleanly after that time, e.g. for learning-rate tests.
 #SBATCH -p gpu
-#SBATCH --gres gpu:1
+#SBATCH --gres gpu:l40:1
 #SBATCH --mem-per-gpu 64G
 #SBATCH --cpus-per-task 8
 #SBATCH --time 96:00:00
@@ -36,6 +41,7 @@ LIMIT_DATASET=${LIMIT_DATASET:-}
 SEED=${SEED:-0}
 BATCH_SIZE=${BATCH_SIZE:-512}
 TIME_LIMIT=${TIME_LIMIT:-}
+CHECKPOINT=${CHECKPOINT:-}
 
 for f in "${TRAINING_FILE}" "${VALIDATION_FILE}"; do
     if [[ ! -f "${f}" ]]; then
@@ -60,6 +66,9 @@ fi
 if [[ -n "${TIME_LIMIT}" ]]; then
     EXTRA_ARGS+=("-t" "${TIME_LIMIT}")
 fi
+if [[ -n "${CHECKPOINT}" ]]; then
+    EXTRA_ARGS+=("-cf" "${CHECKPOINT}")
+fi
 
 echo "Host: $(hostname)"
 echo "Parity: ${PARITY}"
@@ -73,6 +82,7 @@ echo "Epochs override: ${EPOCHS:-from options file}"
 echo "Dataset limit: ${LIMIT_DATASET:-full} percent"
 echo "Seed: ${SEED}"
 echo "Time limit: ${TIME_LIMIT:-none}"
+echo "Resume from: ${CHECKPOINT:-none}"
 echo "Git commit: $(git rev-parse --short HEAD) ($(git status --short | wc -l) uncommitted changes)"
 nvidia-smi -L
 
