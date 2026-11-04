@@ -34,6 +34,7 @@ FEATURES = (
     "btagUParTAK4TauVJet",
 )
 OPTIONAL_SOURCE_COLUMNS = ("vbfjtag", "hhbtag")
+MISSING_SCORE = np.float32(-99999.0)  # ColumnFlow EMPTY_FLOAT, used for optional tagger columns that are not stored
 EMPTY_TARGET = -1
 DEFAULT_COLUMNS = [
     "SPANetJet.mass",
@@ -76,7 +77,15 @@ DEFAULT_COLUMNS = [
     "LHEPart.phi",
     "LHEPart.mass",
     "process_id",
+    "event",
+    "run",
+    "luminosityBlock",
 ]
+EVENT_ID_COLUMNS = ("event", "run", "luminosityBlock")
+
+# process_type values stored in CLASSIFICATIONS/EVENT/process_type. Background uses -1, which the
+# SPANet classification loss ignores (ignore_index=-1).
+PROCESS_TYPES = {"ggf": 0, "vbf": 1, "background": -1}
 
 
 def delta_r(a_eta, a_phi, b_eta, b_phi):
@@ -153,7 +162,46 @@ def source_jets(events: ak.Array, source_collection: str) -> ak.Array:
     return events[source_collection]
 
 
+def lhe_vbf_quarks(events: ak.Array) -> ak.Array:
+    lhe = events.LHEPart
+    return lhe[(lhe.status == 1) & (abs(lhe.pdgId) <= 6) & (abs(lhe.pdgId) != 5)]
+
+
 def vbf_targets_from_genjets(
+    events: ak.Array,
+    source_collection: str,
+    hhb_indices: tuple[np.ndarray, np.ndarray],
+    lhe_to_gen_dr: float,
+    gen_to_reco_dr: float,
+    use_overlap_cleaning: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """VBF targets via LHE quark -> GenJet -> source jet matching.
+
+    Only events with at least two LHE VBF quarks can have VBF truth. The matching below indexes the
+    first two quarks, so it runs on those events only; all other events get EMPTY_TARGET.
+    """
+    n_events = len(events)
+    q1 = np.full(n_events, EMPTY_TARGET, dtype=np.int64)
+    q2 = np.full(n_events, EMPTY_TARGET, dtype=np.int64)
+    has_two = ak.to_numpy(ak.num(lhe_vbf_quarks(events), axis=1) >= 2)
+    if not has_two.any():
+        return q1, q2
+
+    b1, b2 = hhb_indices
+    sub_q1, sub_q2 = _vbf_targets_two_quarks(
+        events[has_two],
+        source_collection,
+        (b1[has_two], b2[has_two]),
+        lhe_to_gen_dr,
+        gen_to_reco_dr,
+        use_overlap_cleaning,
+    )
+    q1[has_two] = sub_q1
+    q2[has_two] = sub_q2
+    return q1, q2
+
+
+def _vbf_targets_two_quarks(
     events: ak.Array,
     source_collection: str,
     hhb_indices: tuple[np.ndarray, np.ndarray],
@@ -163,9 +211,8 @@ def vbf_targets_from_genjets(
 ) -> tuple[np.ndarray, np.ndarray]:
     reco = source_jets(events, source_collection)
     gen = events.GenJet
-    lhe = events.LHEPart
 
-    lhe_vbf = lhe[(lhe.status == 1) & (abs(lhe.pdgId) <= 6) & (abs(lhe.pdgId) != 5)]
+    lhe_vbf = lhe_vbf_quarks(events)
     has_two_lhe = ak.num(lhe_vbf, axis=1) >= 2
 
     reco_mask = (reco.pt > 20.0) & (abs(reco.eta) < 4.7)
@@ -224,6 +271,10 @@ def vbf_targets(
     gen_to_reco_dr: float,
     use_overlap_cleaning: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
+    if truth_mode == "none":
+        missing = np.full(len(events), EMPTY_TARGET, dtype=np.int64)
+        return missing, missing.copy()
+
     if has_truth2_inputs(events):
         return vbf_targets_from_genjets(
             events,
@@ -284,15 +335,39 @@ def matched_truth_indices(truth: ak.Array, reco: ak.Array, dr_max: float) -> tup
     return idx_np[:, 0], idx_np[:, 1]
 
 
-def infer_process_type(path: Path, events: ak.Array) -> np.ndarray:
-    text = str(path).lower()
-    if "hh_vbf" in text or "vbf" in text:
-        value = 1
-    elif "hh_ggf" in text or "gghh" in text or "ggf" in text:
-        value = 0
+def infer_process_type(path: Path, events: ak.Array, requested: str = "auto") -> np.ndarray:
+    if requested != "auto":
+        value = PROCESS_TYPES[requested]
     else:
-        value = -1
+        # The process type decides whether VBF truth is computed, so never guess: the path must name
+        # exactly one of the two signal processes, otherwise --process-type has to be given.
+        text = str(path).lower()
+        is_vbf = "vbf" in text
+        is_ggf = "ggf" in text or "gghh" in text
+        if is_vbf == is_ggf:
+            raise ValueError(
+                f"Cannot infer the process type from the path {path} (it names "
+                f"{'both' if is_vbf else 'neither'} 'vbf' {'and' if is_vbf else 'nor'} 'ggf'/'gghh'). Pass --process-type vbf, ggf or background, converting each sample "
+                f"separately if needed."
+            )
+        value = PROCESS_TYPES["vbf"] if is_vbf else PROCESS_TYPES["ggf"]
     return np.full(len(events), value, dtype=np.int64)
+
+
+def resolve_vbf_truth_mode(requested: str, process_type: int) -> str:
+    """'auto' uses the GenJet VBF truth for VBF samples only. Other samples have no VBF quarks, and in
+    e.g. ttbar the LHE quarks from W decays would otherwise be mistaken for VBF quarks."""
+    if requested == "auto":
+        return "genjet" if process_type == PROCESS_TYPES["vbf"] else "none"
+    return requested
+
+
+def unify_placeholders(values: np.ndarray, feature: str) -> np.ndarray:
+    """Tagger scores use negative placeholders when no score exists (e.g. PNet -1 for forward jets,
+    PNet QvG sometimes -10). Map all of them to -1 so the network sees one consistent 'no score' value."""
+    if feature.startswith("btag"):
+        return np.where(values < 0, np.float32(-1.0), values)
+    return values
 
 
 def load_chunks(paths: list[Path], max_events: int | None) -> list[tuple[Path, ak.Array]]:
@@ -322,6 +397,8 @@ def build_dataset(
     lhe_to_gen_dr: float,
     gen_to_reco_dr: float,
     use_overlap_cleaning: bool,
+    process_type: str = "auto",
+    keep_placeholders: bool = False,
 ) -> dict:
     if not chunks:
         raise ValueError("No events were loaded from the requested parquet files.")
@@ -342,25 +419,42 @@ def build_dataset(
         "q1": [],
         "q2": [],
         "process_type": [],
+        **{column: [] for column in EVENT_ID_COLUMNS},
     }
 
     for (path, events), collection in zip(chunks, source_collections):
         jets = source_jets(events, collection)
         arrays["MASK"].append(source_mask(jets, max_jets))
         missing = [feature for feature in source_features if feature not in jets.fields]
-        if missing:
+        # The optional tagger columns are diagnostics only (e.g. vbfjtag is not stored for 2022). Fill them with
+        # the ColumnFlow "no score" value so all files keep the same structure; anything else must exist.
+        missing_optional = [feature for feature in missing if feature in OPTIONAL_SOURCE_COLUMNS]
+        missing_required = [feature for feature in missing if feature not in OPTIONAL_SOURCE_COLUMNS]
+        if missing_required:
             raise ValueError(
-                f"Requested source feature(s) {missing} missing from {collection} in {path}. "
+                f"Requested source feature(s) {missing_required} missing from {collection} in {path}. "
                 f"Available fields: {jets.fields}"
             )
+        if missing_optional:
+            print(f"WARNING: optional feature(s) {missing_optional} missing in {path}, filled with {MISSING_SCORE}")
         for feature in source_features:
-            arrays[feature].append(padded_feature(jets, feature, max_jets))
+            if feature in missing_optional:
+                arrays[feature].append(np.full((len(events), max_jets), MISSING_SCORE, dtype=np.float32))
+                continue
+            values = padded_feature(jets, feature, max_jets)
+            if not keep_placeholders:
+                values = unify_placeholders(values, feature)
+            arrays[feature].append(values)
+
+        chunk_process_type = infer_process_type(path, events, process_type)
+        chunk_vbf_truth = resolve_vbf_truth_mode(vbf_truth, int(chunk_process_type[0]))
+        print(f"{path}: {len(events)} events, process_type={int(chunk_process_type[0])}, vbf truth={chunk_vbf_truth}")
 
         b1, b2 = matched_truth_indices(higgs_bb_truth(events), jets, hhb_dr)
         q1, q2 = vbf_targets(
             events,
             collection,
-            vbf_truth,
+            chunk_vbf_truth,
             (b1, b2),
             lhe_to_gen_dr,
             gen_to_reco_dr,
@@ -370,7 +464,11 @@ def build_dataset(
         arrays["b2"].append(b2)
         arrays["q1"].append(q1)
         arrays["q2"].append(q2)
-        arrays["process_type"].append(infer_process_type(path, events))
+        arrays["process_type"].append(chunk_process_type)
+        for column in EVENT_ID_COLUMNS:
+            if column not in events.fields:
+                raise ValueError(f"Column {column!r} missing in {path}; it is needed for the even/odd split.")
+            arrays[column].append(ak.to_numpy(events[column]).astype(np.uint64))
 
     return {
         "INPUTS": {
@@ -394,6 +492,10 @@ def build_dataset(
                 "process_type": np.concatenate(arrays["process_type"], axis=0),
             },
         },
+        # Not read by SPANet; used for the even/odd split and to match events back to ColumnFlow.
+        "METADATA": {
+            column: np.concatenate(arrays[column], axis=0) for column in EVENT_ID_COLUMNS
+        },
     }
 
 
@@ -415,6 +517,10 @@ def print_summary(dataset: dict) -> None:
     print(f"max_jets: {mask.shape[1]}")
     print(f"higgs_bb complete: {np.sum((b1 >= 0) & (b2 >= 0))}")
     print(f"vbf complete: {np.sum((q1 >= 0) & (q2 >= 0))}")
+    process_type = dataset["CLASSIFICATIONS"]["EVENT"]["process_type"]
+    print("process_type counts:", dict(zip(*np.unique(process_type, return_counts=True))))
+    event = dataset["METADATA"]["event"]
+    print(f"even events: {np.sum(event % 2 == 0)}, odd events: {np.sum(event % 2 == 1)}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -439,9 +545,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hhb-dr", type=float, default=0.4, help="Maximum dR for Higgs b -> source jet matching.")
     parser.add_argument(
         "--vbf-truth",
-        choices=("auto", "genjet"),
-        default="genjet",
-        help="VBF target definition. Uses LHEPart->GenJet->source jet truth2.",
+        choices=("auto", "genjet", "none"),
+        default="auto",
+        help="VBF target definition. 'genjet' uses LHEPart->GenJet->source jet matching, 'none' writes no VBF "
+             "targets, 'auto' uses 'genjet' for VBF samples and 'none' for all other samples.",
+    )
+    parser.add_argument(
+        "--process-type",
+        choices=("auto", *PROCESS_TYPES),
+        default="auto",
+        help="Process type for all inputs (ggf=0, vbf=1, background=-1). 'auto' infers it from each file path and "
+             "stops with an error if the path does not name exactly one of 'vbf' or 'ggf'/'gghh'.",
+    )
+    parser.add_argument(
+        "--keep-placeholders",
+        action="store_true",
+        help="Keep the original negative placeholder values of tagger scores instead of mapping them all to -1.",
     )
     parser.add_argument("--lhe-to-gen-dr", type=float, default=0.4, help="Maximum dR for LHE VBF parton -> GenJet matching.")
     parser.add_argument("--gen-to-reco-dr", type=float, default=0.3, help="Maximum dR for GenJet -> source jet matching.")
@@ -481,6 +600,8 @@ def main() -> None:
         args.lhe_to_gen_dr,
         args.gen_to_reco_dr,
         not args.no_vbf_overlap_cleaning,
+        args.process_type,
+        args.keep_placeholders,
     )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

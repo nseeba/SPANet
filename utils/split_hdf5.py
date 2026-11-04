@@ -46,6 +46,31 @@ def make_split_assignment(
     return assignment, sizes
 
 
+def make_parity_assignment(
+    event_numbers: np.ndarray,
+    train_parity: str,
+    train: float,
+    val: float,
+    seed: int,
+) -> tuple[np.ndarray, dict[str, int]]:
+    """Even/odd split: events with the training parity are split randomly into train and val (in the ratio
+    train:val), all events with the other parity become the test set. A model trained on these files is
+    therefore never applied to events it was trained on when used for the other parity in ColumnFlow."""
+    parity = 0 if train_parity == "even" else 1
+    in_training = (event_numbers % 2) == parity
+
+    assignment = np.full(len(event_numbers), SPLITS.index("test"), dtype=np.uint8)
+    candidates = np.nonzero(in_training)[0]
+    rng = np.random.RandomState(seed)
+    candidates = candidates[rng.permutation(len(candidates))]
+    n_train = int(round(len(candidates) * train / (train + val)))
+    assignment[candidates[:n_train]] = SPLITS.index("train")
+    assignment[candidates[n_train:]] = SPLITS.index("val")
+
+    sizes = {split_name: int(np.sum(assignment == split_id)) for split_id, split_name in enumerate(SPLITS)}
+    return assignment, sizes
+
+
 def copy_attrs(source, target) -> None:
     for key, value in source.attrs.items():
         target.attrs[key] = value
@@ -230,6 +255,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val", type=float, default=0.1, help="Validation fraction.")
     parser.add_argument("--test", type=float, default=0.1, help="Test fraction.")
     parser.add_argument("--seed", type=int, default=12345, help="Random split seed.")
+    parser.add_argument(
+        "--train-parity",
+        choices=("even", "odd"),
+        default=None,
+        help="Even/odd split using METADATA/event: events with this event-number parity are split into train and "
+             "val (ratio --train:--val), all events with the other parity go to test. --test is ignored. "
+             "Without this option the split is random.",
+    )
     parser.add_argument("--chunk-size", type=int, default=200_000, help="Number of events to stream per chunk.")
     parser.add_argument(
         "--compression",
@@ -251,12 +284,21 @@ def main() -> None:
 
     print(f"Input: {args.input}", flush=True)
     print(f"Events: {num_events}", flush=True)
-    print(f"Split fractions: train={args.train}, val={args.val}, test={args.test}", flush=True)
+    print(f"Split fractions: train={args.train}, val={args.val}, test={args.test if args.train_parity is None else 'other parity'}",
+          flush=True)
     print(f"Seed: {args.seed}", flush=True)
     print(f"Chunk size: {args.chunk_size}", flush=True)
     print(f"Compression: {compression or 'none'}", flush=True)
 
-    assignment, sizes = make_split_assignment(num_events, args.train, args.val, args.test, args.seed)
+    if args.train_parity is None:
+        assignment, sizes = make_split_assignment(num_events, args.train, args.val, args.test, args.seed)
+    else:
+        with h5py.File(args.input, "r") as source:
+            if "METADATA" not in source or "event" not in source["METADATA"]:
+                raise KeyError("--train-parity needs METADATA/event; recreate the HDF5 with the current converter.")
+            event_numbers = source["METADATA"]["event"][:]
+        print(f"Even/odd split: train/val on {args.train_parity} event numbers, test on the others", flush=True)
+        assignment, sizes = make_parity_assignment(event_numbers, args.train_parity, args.train, args.val, args.seed)
     for split_name in SPLITS:
         print(f"{split_name}: {sizes[split_name]} events", flush=True)
 
