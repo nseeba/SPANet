@@ -120,10 +120,9 @@ def normalize_symmetric_targets(model, predictions, targets):
     predictions = [p.copy() for p in predictions]
     targets = [t.copy() for t in targets]
     for target, prediction, decoder in zip(targets, predictions, model.branch_decoders):
-        for indices in decoder.permutation_indices:
-            if len(indices) > 1:
-                prediction[:, indices] = np.sort(prediction[:, indices], axis=1)
-                target[:, indices] = np.sort(target[:, indices], axis=1)
+        for indices in decoder.symmetric_index_groups:
+            prediction[:, indices] = np.sort(prediction[:, indices], axis=1)
+            target[:, indices] = np.sort(target[:, indices], axis=1)
     return predictions, targets
 
 

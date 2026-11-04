@@ -141,12 +141,12 @@ class JetReconstructionValidation(JetReconstructionNetwork):
 
         metrics = self.evaluator.full_report_string(jet_predictions, stacked_targets, stacked_masks, prefix="Purity/")
 
-        # Apply permutation groups for each target
+        # Sort predictions and targets within each group of interchangeable jets, so that e.g. the pair
+        # (b1, b2) = (3, 1) counts as equal to the prediction (1, 3).
         for target, prediction, decoder in zip(stacked_targets, jet_predictions, self.branch_decoders):
-            for indices in decoder.permutation_indices:
-                if len(indices) > 1:
-                    prediction[:, indices] = np.sort(prediction[:, indices])
-                    target[:, indices] = np.sort(target[:, indices])
+            for indices in decoder.symmetric_index_groups:
+                prediction[:, indices] = np.sort(prediction[:, indices], axis=1)
+                target[:, indices] = np.sort(target[:, indices], axis=1)
 
         metrics.update(self.compute_metrics(jet_predictions, particle_scores, stacked_targets, stacked_masks, stacked_weights))
 

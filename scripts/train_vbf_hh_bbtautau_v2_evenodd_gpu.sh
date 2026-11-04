@@ -5,7 +5,8 @@
 #   PARITY=even sbatch scripts/train_vbf_hh_bbtautau_v2_evenodd_gpu.sh
 #   PARITY=odd  sbatch scripts/train_vbf_hh_bbtautau_v2_evenodd_gpu.sh
 #
-# EPOCHS and LIMIT_DATASET can be overridden for a smoke test, SEED for repeated trainings.
+# EPOCHS and LIMIT_DATASET can be overridden for a smoke test, SEED for repeated trainings,
+# TIME_LIMIT (DD:HH:MM:SS) stops training cleanly after that time, e.g. for learning-rate tests.
 #SBATCH -p gpu
 #SBATCH --gres gpu:1
 #SBATCH --mem-per-gpu 64G
@@ -34,6 +35,7 @@ EPOCHS=${EPOCHS:-}
 LIMIT_DATASET=${LIMIT_DATASET:-}
 SEED=${SEED:-0}
 BATCH_SIZE=${BATCH_SIZE:-512}
+TIME_LIMIT=${TIME_LIMIT:-}
 
 for f in "${TRAINING_FILE}" "${VALIDATION_FILE}"; do
     if [[ ! -f "${f}" ]]; then
@@ -55,6 +57,9 @@ fi
 if [[ "${SEED}" != "0" ]]; then
     EXTRA_ARGS+=("-r" "${SEED}")
 fi
+if [[ -n "${TIME_LIMIT}" ]]; then
+    EXTRA_ARGS+=("-t" "${TIME_LIMIT}")
+fi
 
 echo "Host: $(hostname)"
 echo "Parity: ${PARITY}"
@@ -67,6 +72,7 @@ echo "Run name: ${RUN_NAME}"
 echo "Epochs override: ${EPOCHS:-from options file}"
 echo "Dataset limit: ${LIMIT_DATASET:-full} percent"
 echo "Seed: ${SEED}"
+echo "Time limit: ${TIME_LIMIT:-none}"
 echo "Git commit: $(git rev-parse --short HEAD) ($(git status --short | wc -l) uncommitted changes)"
 nvidia-smi -L
 

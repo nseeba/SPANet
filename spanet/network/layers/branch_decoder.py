@@ -57,6 +57,22 @@ class BranchDecoder(nn.Module):
         self.diagonal_mask_operation = self.create_diagonal_mask_operation()
         self.diagonal_masks = {}
 
+    @property
+    def symmetric_index_groups(self) -> List[List[int]]:
+        """ Groups of daughter positions that the permutation group can exchange, e.g. [[0, 1]] for a
+        symmetric jet pair. Sorting predictions and targets within each group makes them comparable.
+
+        (permutation_indices holds cycles, e.g. [[(0, 1)]], and cannot be used for sorting directly.)
+        """
+        orbits = {i: {i} for i in range(self.degree)}
+        for permutation in self.attention.permutation_group:
+            for i, j in enumerate(permutation):
+                merged = orbits[i] | orbits[j]
+                for k in merged:
+                    orbits[k] = merged
+        groups = sorted({tuple(sorted(orbit)) for orbit in orbits.values()})
+        return [list(group) for group in groups if len(group) > 1]
+
     def create_padding_mask_operation(self, batch_size: int):
         weights_index_names = self.WEIGHTS_INDEX_NAMES[:self.degree]
         operands = ','.join(map(lambda x: 'b' + x, weights_index_names))
