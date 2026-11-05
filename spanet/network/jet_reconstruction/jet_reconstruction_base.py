@@ -209,7 +209,10 @@ class JetReconstructionBase(pl.LightningModule):
         return self.dataloader(self.training_dataset, shuffle=True, drop_last=True, **self.dataloader_options)
 
     def val_dataloader(self) -> DataLoader:
-        return self.dataloader(self.validation_dataset, drop_last=True, **self.dataloader_options)
+        # Shuffled so that every validation batch is a mix of samples. The validation files are ordered by
+        # sample, and the per-batch loss normalisation (divide by the number of events with the particle)
+        # blows up on batches that contain no event with that particle, e.g. pure ggF batches for VBF.
+        return self.dataloader(self.validation_dataset, shuffle=True, drop_last=True, **self.dataloader_options)
 
     def test_dataloader(self) -> DataLoader:
         if self.testing_dataset is None:
